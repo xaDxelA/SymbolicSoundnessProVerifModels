@@ -1,0 +1,941 @@
+free c: channel.
+
+(* 
+
+This model is  a process used to establish the soundness results in 
+
+Dax, Kunnemann: On the Soundness of Infrastructure Adversaries
+
+It covers network of clients and servers running the SMTP, DNS and DNSSEC
+protocols in a setting that civers a simplified version of inter-AS
+communication. Hence the attacker must corruption communication channels before
+being able to eavesdrop.
+
+
+Notes:
+
+We use 9 private constructor symbols, 6 for modeling communication that is
+secure until corruption, and 4 to deal with state that is secure until
+corruption.
+
+**Communication:** The protocol for establishing a communication channel is as
+follows. Say A wants to communicate with B.
+
+1. At initialization time, A broadcasts information about himself: IP, domain,
+   AS, depending on the context, association of an abstract provider (e.g., "I
+   am a mail server of google"). This information is bundled in transparent
+   constructors, i.e., constructors that can be deconstructed without any
+   additional secrets. Their purpose is to keep the model maintainable, and
+   they are marked with a `_info` suffix.  Their type is `service`.
+2. (same for B)
+3. A is instructed by the adversary whom to communicate with --- this is the
+   standard way of modeling arbitrary communication patterns. The communication
+   partner is identified by a term of type `service` as output in step 1.$^1$
+4. (same for B)
+5. A choses a source port and uses `c_communicate_src_port` to communicate it
+   to B. The function symbol is private, but it has a destructor for the source
+   port, meaning that this information is revealed to the attacker. It does not
+   have a destructor for the description of the target service, which is
+   admittedly unintuitive, but was necessary to speed up verification time. As
+   this information is shared at initialization time, it is always available to
+   the attacker anyway. We typed this parameter (type `service`), so we can
+   ensure that the function symbol is indeed used that way.
+6. B unpacks this source port using the destructor for
+   `c_communicate_src_port`.
+7. Then the source ports are exchanged in the other direction, B repeats step
+   5, but for the function symbol `r_communicate_src_port`.
+8. A receives the source port with the destructor for `r_communicate_src_port`.
+9. Now both parties can build the key that identifies these channels with the
+   function symbol `chanbuilder`. There are, in fact, two channels, one for
+   messages from A to B, and another for messages from B to A. A party that
+   knows the channel (i.e., a `chanbuilder-`term, i.e., a term of type `chan`)
+   can obtain the message on this channel using the destructor `get_req_packet`.
+
+$^1$ The exception is the SMTP client process, in which the attacker supplies
+only the provider (e.g., "google.com"), as this is the information that the
+SMTP client has in the real-world (e.g., through the To: field in the email).
+Instead, the IP and domain are obtained using the DNS resolver process.
+
+There are five private function symbols for communicating the source port that
+way, one for every role in the protocol, plus the `chanbuilder` function symbol
+that sets up the channel (of type `chan`). Why is such a complicated protocol
+necessary? As outlined in the paper, we use the `chanbuilder` terms to
+establish private-but-asynchronous channels. Hence the need for `chanbuilder`
+to be private. As in the IP protocol, the channel is identified by source and
+destination IP and port. Hence, these need to be communicated to set up that
+channel. In the IP protocol, this is part of a handshake. An alternative and
+seemingly more natural modeling would be to allow to extract the source port
+from a `chanbuilder`-term, however, in that modeling, a channel could only be
+corrupted once the first message has been sent. Our modeling ensures that
+a channel can be corrupted before the first message is being sent. This
+explains the need to send the source port before the first message. The message
+that communicates the source port is in a private constructor to ensure
+authenticity, so that a channel cannot be manipulated *before* it is corrupted.
+The terms within that constructor are public or can be computed. We have five
+different versions of this constructor, one for each party, to again improve
+verification time. This is a valid modeling choice because in the real world,
+the message that communicates the source port identifies the intended protocol
+type and role of the sender via the destination port.
+
+
+**Storage**: The four remaining private function symbols are used instead of
+a global storage (we use ProVerif's `table` feature only for the publicly known
+public keys of DNSSEC root servers). They represent local database entries
+created on initiasation.
+        - `register_server` binds an SMPT servers domain to an IP. This is only
+          used by the authoritative nameserver, where it represents its local
+          registration DB. They are generated in the top-level process upon
+          initalisation, where they are controlled by the attacker, but cannot
+          be changed later. It is used to answer `A`-requests.
+        - `register_provider` binds providers (the part of email addresses
+          after the "@") to the domains providing SMTP services for them. It is
+          set up just like `register_server` but is used to handle
+          `MX`-requests.
+   - `register_ns` binds nameserver to their public keys. `register_ns` terms
+     are used by the root server to provide the public key of the authoritative
+     nameserver directly below it. They, again, correspond to a local
+     registration database, are used nowhere else and are controlled by the
+     attacker upon initialisation, but not later.
+   - `valid_prov` marks a valid provider, e.g., "google.com". This corresponds
+     to the public (or the part of the public covered when Speicher et al
+     consider, e.g., the Top-10 providers) knowing which provider they use.
+
+There are at least two other established ways of implementing a local store.
+First are ProVerif's tables, which implements a key/value store. Unfortunately,
+it was not readily clear what could provide a key. Neither domain, IP or AS are
+unique identifiers, hence values would risk being overwritten. The second are
+private channels, which, giving our experiences with the modelling of
+communication channels, we were worried about slowing down verification.
+
+*)
+
+
+
+(* types *)
+type provider.
+type dom.
+type ip.
+type as.
+type port.
+type service.
+type chan.
+type regis.
+type com.
+
+(* DNSSEC PKI trustbase*)
+table trustbase(port, bitstring).
+
+(* global names*)
+free CLIENT_PORT:port.
+free SERVER_PORT:port.
+free RES_PORT:port.
+free NS_PORT:port.
+free ROOT_PORT:port.
+
+free OK:bitstring.
+
+(* signature *)
+fun vk(bitstring):bitstring. (* vk/1 *)
+fun sign(bitstring,bitstring):bitstring. (* sign/2 *)
+reduc forall sk:bitstring, m:bitstring; readsign(sign(sk,m)) = m.
+reduc forall sk:bitstring, m:bitstring; verify(vk(sk), m, sign(sk,m)) = true.
+
+(* pairs *)
+fun pair(bitstring,bitstring):bitstring [data].
+
+
+(* mx pairs *)
+fun mx_pair(provider,dom):bitstring.
+reduc forall x:provider, y:dom; mx_fst(mx_pair(x,y))=x.
+reduc forall x:provider, y:dom; mx_snd(mx_pair(x,y))=y.
+
+(* rr pairs *)
+fun rr_pair(dom,ip):bitstring.
+reduc forall x:dom, y:ip; rr_fst(rr_pair(x,y))=x.
+reduc forall x:dom, y:ip; rr_snd(rr_pair(x,y))=y.
+
+(* ds pairs *)
+fun ds_pair(service,bitstring):bitstring.
+reduc forall x:service, y:bitstring; ds_fst(ds_pair(x,y))=x.
+reduc forall x:service, y:bitstring; ds_snd(ds_pair(x,y))=y.
+
+
+(* dnssec response wrapper *)
+fun dnssec_resp(bitstring, bitstring, bitstring, bitstring, bitstring):bitstring [data].
+
+(* request A record*)
+fun request_dom(dom):bitstring.
+reduc forall x:dom; get_dom_request(request_dom(x))=x.
+
+(* request MX record*)
+fun request(provider):bitstring.
+reduc forall x:provider; get_request_prov(request(x))=x.
+
+(* dnssec request A record *)
+fun dnssec_request(dom):bitstring.
+reduc forall x:dom; get_dnssec_dom(dnssec_request(x))=x.
+
+(* dnssec request MX record *)
+fun dnssec_request_prov(provider):bitstring.
+reduc forall x:provider; get_dnssec_prov(dnssec_request_prov(x))=x.
+
+(* answer A record *)
+fun answer(bitstring,ip,dom):bitstring.
+reduc forall x:bitstring, y:ip, z:dom; check_answer_req(answer(x,y,z))=x.
+reduc forall x:bitstring, y:ip, z:dom; get_answer_ip(answer(x,y,z))=y.
+reduc forall x:bitstring, y:ip, z:dom; get_answer_dom(answer(x,y,z))=z.
+
+(* answer MX record *)
+fun answer_dom(bitstring,provider,dom):bitstring.
+reduc forall x:bitstring, y:provider, z:dom; check_req_answer(answer_dom(x,y,z))=x.
+reduc forall x:bitstring, y:provider, z:dom; get_prov_answer(answer_dom(x,y,z))=y.
+reduc forall x:bitstring, y:provider, z:dom; get_dom_answer(answer_dom(x,y,z))=z.
+
+(* SMTP message wrapper *)
+fun smtp_req(ip,ip,bitstring):bitstring.
+reduc forall x:ip, y:ip, z:bitstring; smtp_fst(smtp_req(x,y,z))=x.
+reduc forall x:ip, y:ip, z:bitstring; smtp_snd(smtp_req(x,y,z))=y.
+reduc forall x:ip, y:ip, z:bitstring; smtp_third(smtp_req(x,y,z))=z.
+
+(* private channel wrapper using secret value x:chan - requests *)
+fun req_packet(chan,bitstring):bitstring.
+reduc forall x:chan, y:bitstring; get_req_packet(x,req_packet(x,y))=y.
+
+(* private channel wrapper using secret value x:chan - answers *)
+fun ans_packet(chan,bitstring):bitstring.
+reduc forall x:chan, y:bitstring; get_ans_packet(x,ans_packet(x,y))=y.
+
+(* public client information *)
+fun client_info(provider,as,ip,dom):service.
+reduc forall a:provider, b:as, x:ip, d:dom; get_client_prov(client_info(a,b,x,d))=a.
+reduc forall a:provider, b:as, x:ip, d:dom; get_client_as(client_info(a,b,x,d))=b.
+reduc forall a:provider, b:as, x:ip, d:dom; get_client_ip(client_info(a,b,x,d))=x.
+reduc forall a:provider, b:as, x:ip, d:dom; get_client_dom(client_info(a,b,x,d))=d.
+
+(* public server information *)
+fun server_info(provider,as,ip,dom):service.
+reduc forall a:provider, b:as, x:ip, d:dom; get_server_prov(server_info(a,b,x,d))=a.
+reduc forall a:provider, b:as, x:ip, d:dom; get_server_as(server_info(a,b,x,d))=b.
+reduc forall a:provider, b:as, x:ip, d:dom; get_server_ip(server_info(a,b,x,d))=x.
+reduc forall a:provider, b:as, x:ip, d:dom; get_server_dom(server_info(a,b,x,d))=d.
+
+(* public resolver information *)
+fun res_info(dom,ip,as):service.
+reduc forall a:dom, b:ip, x:as; get_res_dom(res_info(a,b,x))=a.
+reduc forall a:dom, b:ip, x:as; get_res_ip(res_info(a,b,x))=b.
+reduc forall a:dom, b:ip, x:as; get_res_as(res_info(a,b,x))=x.
+
+(* public NS information *)
+fun dns_info(dom, ip, as):service.
+reduc forall a:dom, b:ip, x:as; get_dns_dom(dns_info(a,b,x))=a.
+reduc forall a:dom, b:ip, x:as; get_dns_ip(dns_info(a,b,x))=b.
+reduc forall a:dom, b:ip, x:as; get_dns_as(dns_info(a,b,x))=x.
+
+(* public root NS information *)
+fun root_info(dom, ip, as):service.
+reduc forall a:dom, b:ip, x:as; get_root_dom(root_info(a,b,x))=a.
+reduc forall a:dom, b:ip, x:as; get_root_ip(root_info(a,b,x))=b.
+reduc forall a:dom, b:ip, x:as; get_root_as(root_info(a,b,x))=x.
+
+(* wrapper for NS resolution, root NS requests*)
+fun ask(service):bitstring.
+reduc forall x:service; get_ask(ask(x))=x.
+
+(* The following constructor symbols are flagged as private. All these constructors are used to 
+exchange information between subprocesses. As there are no pre-shared secrets and we require 
+authenticated information exchange, we use these private constructors as trusted channels. 
+With flagging constructors as private, the adversary cannot use the constructor and hence all 
+occurrences of these constructors are honestly generated. The authenticated information exchange
+is needed by our custom threat model as we require an adversary to corrupt a connection before 
+it can use its Dolev-Yao model power. *)
+
+(* trusted registration for A records of mailservers *)
+fun register_server(dom,ip):regis [private].
+reduc forall x:dom, y:ip; get_ip(x,register_server(x,y))=y.
+
+(* register MX records *)
+fun register_provider(provider,dom):service [private].
+reduc forall a:provider, x:dom; get_valid_prov(register_provider(a,x))=a.
+reduc forall a:provider, x:dom; get_valid_dom(register_provider(a,x))=x.
+
+(* providers who registered a mailserver able to receive messages *)
+fun valid_prov(provider):provider [private].
+reduc forall a:provider; get_prov_valid(valid_prov(a))=a.
+
+(* trusted registration for name servers *)
+fun register_ns(service,bitstring):regis [private].
+reduc forall x:service, y:bitstring; get_chan(x,register_ns(x,y))=y.
+
+fun c_communicate_src_port(service,port):com [private].
+reduc forall x:service, y:port; c_get_src_port(x,c_communicate_src_port(x,y))=y.
+
+fun s_communicate_src_port(ip,port):com [private].
+reduc forall x:ip, y:port; s_get_src_port(x,s_communicate_src_port(x,y))=y.
+
+fun r_communicate_src_port(service,port):com [private].
+reduc forall x:service, y:port; r_get_src_port(x,r_communicate_src_port(x,y))=y.
+
+fun d_communicate_src_port(service,port):com [private].
+reduc forall x:service, y:port; d_get_src_port(x,d_communicate_src_port(x,y))=y.
+
+fun a_communicate_src_port(service,port):com [private].
+reduc forall x:service, y:port; a_get_src_port(x,a_communicate_src_port(x,y))=y.
+
+
+
+
+(* private constructor to build channels between two parties*)
+fun chanbuilder(ip,port,ip,port):chan [private].
+
+
+
+
+(* events *)
+event Received(provider,dom,ip).
+event Register_A(dom,ip).
+event Register_MX(provider,dom).
+event C_ip(ip).
+event C_as(as).
+event queries(ip,dom).
+event queries_prov(ip,provider).
+event Resolver(ip,ip).
+event C_routing(ip,ip).
+event UsedDomainServer(ip,ip).
+event isMailserver(dom,provider).
+event Routing(as,as,as).
+event Unconf(provider,provider).
+event A_record(ip,dom).
+event nDNSSEC(provider).
+event IPinAS(ip,as).
+
+
+
+
+
+
+(* Unconf Query *)
+query m:provider, n:provider, m':dom, n':dom, e:ip, d:dom,
+      f:dom, g:ip ,x:as, y:as, z:as, r:ip, i:ip, j:ip;
+    event(Unconf(m,n))  ==>   (event(isMailserver(m',m)) (*r-compromise*)
+                            && event(A_record(i,m'))
+                            && event(C_ip(i)))
+                        ||  (event(isMailserver(n',n))  (*r-compromise*)
+                            && event(A_record(i,n'))
+                            && event(C_ip(i)))
+                        ||  (event(isMailserver(m',m))  (*r-fake-mx,*)
+                            && event(A_record(i,m'))    (*r-fake-ip,*)
+                            && event(Received(n,d,r))   (*r-fake-mx-strict*)
+                            &&(
+                              (event(queries_prov(i,n))
+                              && event(Resolver(i,g))
+                              && event(C_ip(g)))
+                            ||(event(queries_prov(i,n))
+                              && event(Resolver(i,g))
+                              && event(UsedDomainServer(g,e))
+                              && event(C_ip(e)))
+                            ||(event(queries_prov(i,n))
+                              && event(Resolver(i,g))
+                              && event(C_routing(i,g)))
+                            ||(event(queries_prov(i,n))
+                              && event(Resolver(i,g))
+                              && event(UsedDomainServer(g,e))
+                              && event(C_routing(g,e))
+                              && event(nDNSSEC(n)))))
+                        ||  (event(isMailserver(m',m))  (*r-intercept*)
+                            && event(A_record(i,m'))
+                            && event(queries_prov(i,n))
+                            && event(Received(n,d,j))
+                            && event(C_routing(i,j))). 
+
+
+(* Integrity Query *)
+query x:provider, a:as, b:as, z:as, d:dom, n:ip, m:ip, p:ip, e:ip, f:ip, g:ip;
+    event(Received(x,d,m)) ==> (event(Register_MX(x,d)) 
+                          && event(Register_A(d,m))) (*Sanity check*)
+                        ||   (event(queries_prov(f,x)) (*Sanity check*)
+                          && event(C_ip(f)))
+                        ||  (event(queries_prov(f,x))(*r-dns-res*)
+                          && event(Resolver(f,g))
+                          && event(C_ip(g)))
+                        ||  (event(queries_prov(f,x)) (*r-dns-route-res*)
+                          && event(Resolver(f,g))
+                          && event(C_routing(f,g)))
+                        ||  (event(queries_prov(f,x)) (*r-dns-route-ns*)
+                          && event(Resolver(f,g))
+                          && event(UsedDomainServer(g,e))
+                          && event(C_routing(g,e))
+                          && event(nDNSSEC(x)))
+                        ||  (event(queries_prov(f,x)) (*r-dns-ns*)
+                          && event(Resolver(f,g))
+                          && event(UsedDomainServer(g,e))
+                          && event(C_ip(e))).
+
+
+(* Root Nameserver *)
+let root_server(dom_root:dom, ip_root:ip, AS:as) =
+    (* Receive public information of the resolver process *)
+    in(c, reswrap:service);
+    !(
+    (* Choose fresh source port for each session *)
+    new port_root:port;
+    out(c,port_root);
+    (* Send src port over trusted channel to communication partner. The previous line seems redundant since the 
+    adversary can gain the same knowledge as the key to the private constructor is publically known. We keep this redundance because
+    the first line expresses that the port is publically known, whereas the second represents that it is sent over a trusted channel. *)
+    out(c, a_communicate_src_port(root_info(dom_root,ip_root,AS),port_root));
+    (* Choose new DNSSEC keys each session.*)
+    new ksk:bitstring;
+    out(c,vk(ksk));
+    new zsk:bitstring;
+    out(c,vk(zsk));
+    (* distribute the public part of the key signing key to the trustbase *)
+    insert trustbase(port_root, vk(ksk));
+    let ip_res = get_res_ip(reswrap) in
+    (* Build private channel over IPs, the fresh src port and the *)
+    (* public target port. *)
+    let rootchan = chanbuilder(ip_root,port_root,ip_res,RES_PORT) in
+    in(c, res_packed_src_port:com);
+    let port_res = r_get_src_port(reswrap,res_packed_src_port) in
+    let rootchan2 = chanbuilder(ip_res,port_res,ip_root,ROOT_PORT) in
+    (
+    ( (* Receive a request from a resolver *)
+      in(c, req:bitstring);
+        let pack = get_req_packet(rootchan2, req) in
+        (* Let adversary provide the information of the *)
+        (* nameserver in charge of the requested zone *)
+        in(c ,dnswrap:service);
+        let askdns = ask(dnswrap) in
+          out(c, req_packet(rootchan,askdns))   
+          )
+    |
+    ((* Receive a request from a resolver *)
+      in(c, dnssec_req:bitstring);
+      let dnssec_pack = get_req_packet(rootchan2, dnssec_req) in
+        (* Let adversary provide the information of the *)
+        (* nameserver in charge of the requested zone *)
+        in(c ,dnssecwrap:service);
+          (* Check that the nameserver is registered for *)
+          (* DNSSEC and receive its public ksk *)
+          in(c, registration_ns:regis);
+          let pk_dns = get_chan(dnssecwrap,registration_ns) in
+            (* Prepare DS record and answer the resolver *)
+            let answer_dns = ds_pair(dnssecwrap,pk_dns) in
+              let rr = pair(vk(zsk),vk(ksk)) in
+                let rr_sig = sign(ksk, rr) in
+                  let ds = answer_dns in
+                    let ds_sig = sign(zsk, ds) in
+                      let dnssec_comb_message = dnssec_resp(answer_dns,rr,rr_sig,ds,ds_sig) in
+                        out(c, req_packet(rootchan,dnssec_comb_message))   
+          )
+    ))
+    .
+
+(* Authorative Nameserver *)
+let dns_server(dom_dns:dom,ip_dns:ip,AS:as) =
+  (* Receive public information of the resolver process *)
+    in(c, reswrap:service);
+    !( 
+    (* Choose fresh source port for each session *) 
+    new port_dns:port;
+    (* Give source port to the adversary *)
+    out(c,port_dns);
+    (* Send src port over trusted channel to communication partner. The previous line seems redundant since the 
+    adversary can gain the same knowledge as the key to the private constructor is publically known. We keep this redundance because
+    the first line expresses that the port is publically known, whereas the second represents that it is sent over a trusted channel. *)
+    out(c,d_communicate_src_port(dns_info(dom_dns,ip_dns,AS),port_dns));
+    (* Choose new DNSSEC keys each session.*)
+    new ksk:bitstring;
+    out(c,vk(ksk));
+    new zsk:bitstring;
+    out(c,vk(zsk));
+    (* distribute the public part of the key signing key to the trustbase *)
+    out(c, register_ns(dns_info(dom_dns,ip_dns,AS), vk(ksk)));
+    (* Build private channel over IPs, the fresh src port and the *)
+    (* public target port. *)
+    let ip_res = get_res_ip(reswrap) in
+    let dnschan = chanbuilder(ip_dns,port_dns,ip_res,RES_PORT) in
+    in(c, port_packet_src_res:com);
+    let port_res = r_get_src_port(reswrap,port_packet_src_res) in
+    let dnschan2 = chanbuilder(ip_res, port_res, ip_dns, NS_PORT) in
+    (
+    ( (* Corrupted IP -> Keys and Channels are leaked to the adversary *)
+    event C_ip(ip_dns);
+    out(c,ksk);
+    out(c,zsk);
+    out(c,dnschan);
+    out(c,dnschan2))
+    |
+    ((* Corrupted AS -> all IPs located in this AS are leaked -> *)
+    (* Corrupted IP -> Keys and Channels are leaked to the adversary *)
+    event C_as(AS);
+    event C_ip(ip_dns);
+    out(c,ksk);
+    out(c,zsk);
+    out(c,dnschan);
+    out(c,dnschan2))
+    |
+    ((* Adversary chooses an AS to be corrupted and chooses to route *)
+    (* over this AS. This leaks the channel over this route to be leaked *)
+    in(c,inter2:as);
+    let as_res = get_res_as(reswrap) in
+    event Routing(as_res, inter2, AS);
+    event C_as(inter2);
+    event C_routing(get_res_ip(reswrap),ip_dns);
+    out(c,dnschan))
+    |
+    ((* Adversary chooses an AS to be corrupted and chooses to route *)
+    (* over this AS. This leaks the channel over this route to be leaked *)
+    in(c,inter21:as);
+    let as_res1 = get_res_as(reswrap) in
+    event Routing(as_res1, inter21, AS);
+    event C_as(inter21);
+    event C_routing(get_res_ip(reswrap),ip_dns);
+    out(c,dnschan2))
+    |
+    ( (* Receive MX record request from resolver*)
+    in(c, req:bitstring);
+    let real_pack = get_req_packet(dnschan2, req) in
+          let provi = get_request_prov(real_pack) in
+          (* Adversary provides a valid (priory registered) MX record *)
+          in(c, valid:service);
+            let provj = get_valid_prov(valid) in
+            if provi = provj then
+              let dom_prov = get_valid_dom(valid) in
+                out(c, ans_packet(dnschan,answer_dom(real_pack, provi, dom_prov)))
+            )
+    |
+    ( (* Receive A record request from resolver*)
+    in(c, req2:bitstring);
+    let real_pack2 = get_req_packet(dnschan2, req2) in
+          let domi = get_dom_request(real_pack2) in
+          in(c, registration:regis);
+          (* Adversary provides a valid (priory registered) A record *)
+              let ip4=get_ip(domi,registration) in
+                out(c, ans_packet(dnschan,answer(real_pack2, ip4, domi)))
+            )
+    |
+    ( (* Receive MX record, DNSSEC request from resolver*)
+    in(c, dnssec_req:bitstring);
+    let dnssec_pack = get_req_packet(dnschan2, dnssec_req) in
+        let domi = get_dnssec_dom(dnssec_pack) in
+        (* Adversary provides a valid (priory registered) A record *)
+          in(c, registration:regis);
+            let ip4=get_ip(domi,registration) in
+            (* Prepare A record and answer the resolver *)
+            let answer_dns = rr_pair(domi,ip4) in
+              let rr = pair(vk(zsk),vk(ksk)) in
+                let rr_sig = sign(ksk, rr) in
+                  let a_rec = answer_dns in
+                    let a_sig = sign(zsk, a_rec) in
+                      let dnssec_comb_message = dnssec_resp(answer_dns,rr,rr_sig,a_rec,a_sig) in
+                        out(c, ans_packet(dnschan,dnssec_comb_message))   
+          )
+    |
+    ( (* Receive A record, DNSSEC request from resolver*)
+    in(c, dnssec_req2:bitstring);
+    let dnssec_pack = get_req_packet(dnschan2, dnssec_req2) in
+        let provi = get_dnssec_prov(dnssec_pack) in
+        (* Adversary provides a valid (priory registered) MX record *)
+          in(c, valid:service);
+          let provj = get_valid_prov(valid) in
+            if provi = provj then
+            let dom_prov = get_valid_dom(valid) in
+            (* Prepare MX record and answer the resolver *)
+            let answer_dns2 = mx_pair(provi,dom_prov) in
+              let rr = pair(vk(zsk),vk(ksk)) in
+                let rr_sig = sign(ksk, rr) in
+                  let mx_rec = answer_dns2 in
+                    let mx_sig = sign(zsk, mx_rec) in
+                      let dnssec_comb_message2 = dnssec_resp(answer_dns2,rr,rr_sig,mx_rec,mx_sig) in
+                        out(c, ans_packet(dnschan,dnssec_comb_message2))   
+          )
+    ))
+    .
+
+let resolver(dom_res:dom,ip_res:ip,AS:as) =
+    (* Receive public information of the root NS process *)
+    in(c, rootwrap:service);
+    (* Receive public information of the client MX process *)
+    in(c, clientwrap:service);
+    !( 
+    (* Choose fresh source port for each session *)  
+    new port_res:port;
+    out(c,port_res);
+    (* Send src port over trusted channel to communication partner. The previous line seems redundant since the 
+    adversary can gain the same knowledge as the key to the private constructor is publically known. We keep this redundance because
+    the first line expresses that the port is publically known, whereas the second represents that it is sent over a trusted channel. *)
+    out(c, r_communicate_src_port(res_info(dom_res,ip_res,AS),port_res));
+    let root_ip = get_root_ip(rootwrap) in
+    let client_ip = get_client_ip(clientwrap) in
+    (* Build private channel over IPs, the fresh src port and the *)
+    (* public target port. *)
+    let resolverchan = chanbuilder(ip_res,port_res, root_ip, ROOT_PORT) in
+    in(c, root_packed_src_port:com);
+    let root_port = a_get_src_port(rootwrap,root_packed_src_port) in
+    let resolverchan2 = chanbuilder(root_ip,root_port,ip_res,RES_PORT) in
+    (* Build private channel over IPs, the fresh src port and the *)
+    (* public target port. *)
+    let resolverchan3 = chanbuilder(ip_res,port_res,client_ip,CLIENT_PORT) in
+    in(c, client_packed_src_port:com);
+    let client_port = c_get_src_port(clientwrap,client_packed_src_port) in
+    let resolverchan4 = chanbuilder(client_ip, client_port,ip_res,RES_PORT) in
+    event UsedDomainServer(ip_res,get_root_ip(rootwrap));
+    (
+    ((* Corrupted IP -> Keys and Channels are leaked to the adversary *)
+    event C_ip(ip_res);
+    out(c,resolverchan);
+    out(c,resolverchan2);
+    out(c,resolverchan3);
+    out(c,resolverchan4))
+    |
+    ((* Corrupted AS -> all IPs located in this AS are leaked -> *)
+    (* Corrupted IP -> Keys and Channels are leaked to the adversary *)
+    event C_as(AS);
+    event C_ip(ip_res);
+    out(c,resolverchan);
+    out(c,resolverchan2);
+    out(c,resolverchan3);
+    out(c,resolverchan4))
+    |
+    ((* Adversary chooses an AS to be corrupted and chooses to route *)
+    (* over this AS. This leaks the channel over this route to be leaked *)
+    in(c,inter1:as);
+    let as_root = get_root_as(rootwrap) in
+      event Routing(AS, inter1, as_root);
+      event C_as(inter1);
+      event C_routing(ip_res,get_root_ip(rootwrap));
+      out(c,resolverchan))
+    |
+    (
+    (* Adversary chooses an AS to be corrupted and chooses to route *)
+    (* over this AS. This leaks the channel over this route to be leaked *)
+    in(c,inter11:as);
+    let as_root1 = get_root_as(rootwrap) in
+      event Routing(AS, inter11, as_root1);
+      event C_as(inter11);
+      event C_routing(ip_res,get_root_ip(rootwrap));
+      out(c,resolverchan2))
+    |
+    ((* get request for name resolution from client *)
+    in(c, req:bitstring);
+    let real_pack = get_req_packet(resolverchan4, req) in
+        (* send request for authoritave name server to root NS *)
+        out(c, req_packet(resolverchan,real_pack));
+        in(c,rootans:bitstring);
+        let root_pack = get_req_packet(resolverchan2, rootans) in
+            let dnsinfo = get_ask(root_pack) in
+              event UsedDomainServer(ip_res,get_dns_ip(dnsinfo));
+              let dns_ip = get_dns_ip(dnsinfo) in
+              (* Build private channel over IPs, the fresh src port and the *)
+              (* public target port with the NS server information by the root NS. *)
+              let resdnschan = chanbuilder(ip_res,port_res,dns_ip,NS_PORT) in
+              in(c, dns_port_packet:com);
+              let dns_port = d_get_src_port(dnsinfo,dns_port_packet) in
+              let resdnschan2 = chanbuilder(dns_ip,dns_port,ip_res,RES_PORT) in
+              (* Send request for MX record *)
+              out(c, req_packet(resdnschan,real_pack));
+              in(c, ans:bitstring);
+              let real_pack3 = get_ans_packet(resdnschan2, ans) in
+                let prov_ans = get_prov_answer(real_pack3) in
+                if prov_ans = get_request_prov(real_pack) then
+                let dom_ans = get_dom_answer(real_pack3) in
+                event queries(client_ip,dom_ans);
+                (* Send request for A record of the domain priory received *)
+                out(c, req_packet(resdnschan,request_dom(dom_ans)));
+                in(c, ans2:bitstring);
+                let real_pack4 = get_ans_packet(resdnschan2, ans2) in
+                if dom_ans = get_answer_dom(real_pack4) then
+                  let answer_final = answer(real_pack,get_answer_ip(real_pack4),get_answer_dom(real_pack4)) in
+                  event nDNSSEC(prov_ans);
+                    out(c, ans_packet(resolverchan3,answer_final))
+                    
+        
+    )
+    |
+    ((* get request for name resolution from client *)
+    in(c, req_dnssec:bitstring);
+    let real_pack = get_req_packet(resolverchan4, req_dnssec) in
+    (* send request for authoritave name server to root NS using the DNSSEC protocol *)
+        out(c, req_packet(resolverchan,real_pack));
+        in(c,rootans:bitstring);
+        (*receive DS record from root server *)
+        let root_pack = get_req_packet(resolverchan2, rootans) in
+            let dnssec_resp(ds_ans,pair(root_zsk,root_ksk),rr_sig_r,ds,ds_sig) = root_pack in
+                (* get root key from the trustbase and continue to verify the message *)
+                  get trustbase(=root_port, true_ksk_pub) in
+                    if true_ksk_pub = root_ksk then
+                      if verify(root_ksk, pair(root_zsk,root_ksk), rr_sig_r)=true then
+                        let pk_dnssec = ds_snd(ds_ans) in
+                          if ds_ans = ds then
+                            if verify(root_zsk, ds, ds_sig) = true then
+                              let dnswrapper = ds_fst(ds_ans) in
+              let dns_ip = get_dns_ip(dnswrapper) in
+              (* Build private channel over IPs, the fresh src port and the *)
+              (* public target port with the NS server information by the root NS. *)
+              let resdnschan = chanbuilder(ip_res,port_res,dns_ip,NS_PORT) in
+              in(c, dns_port_packet:com);
+              let dns_port = d_get_src_port(dnswrapper,dns_port_packet) in
+              let resdnschan2 = chanbuilder(dns_ip,dns_port,ip_res,RES_PORT) in
+              event UsedDomainServer(ip_res,dns_ip);
+              let provreq = get_request_prov(real_pack) in
+              (* Send request for MX record using the DNSSEC protocol *)
+              out(c, req_packet(resdnschan,dnssec_request_prov(provreq)));
+              in(c, ans:bitstring);
+              let comb_message = get_ans_packet(resdnschan2, ans) in
+                (* Start to verify the MX record using the key received from the root NS*)
+                  let dnssec_resp(MX,pair(top_zsk1,top_ksk1),mx_sig_t,mx_rec,mx_sig) = comb_message in
+                  let prov_resp = mx_fst(MX) in
+                    if prov_resp = provreq then
+                        if pk_dnssec = top_ksk1 then
+                          if verify(top_ksk1, pair(top_zsk1,top_ksk1), mx_sig_t)=true then
+                              if mx_rec = MX then
+                                if verify(top_zsk1, mx_rec, mx_sig) = true then
+                                  let dom_ans = mx_snd(MX) in
+              event queries(client_ip,dom_ans);
+              (* Send request for A record  using the DNSSEC protocol *)
+              out(c, req_packet(resdnschan,dnssec_request(dom_ans)));
+              in(c, ans2:bitstring);
+              let comb_message2 = get_ans_packet(resdnschan2, ans2) in
+                (* Start to verify the A record using the key received from the root NS*)
+                  let dnssec_resp(A,pair(top_zsk2,top_ksk2),a_sig_t,a_rec,a_sig) = comb_message2 in
+                  let dom_resp = rr_fst(A) in
+                    if dom_resp = dom_ans then
+                        if pk_dnssec = top_ksk2 then
+                          if verify(top_ksk2, pair(top_zsk2,top_ksk2), a_sig_t)=true then
+                              if a_rec = A then
+                                if verify(top_zsk2, a_rec, a_sig) = true then
+                                  let ip_ans = rr_snd(A) in
+                                  (*Finally send the answer of the name resolution *)
+                                  (* to the client process *)
+                                  let real_pack_dnssec = answer(request(provreq),ip_ans,dom_ans) in
+                                    out(c, ans_packet(resolverchan3,real_pack_dnssec))
+              )
+    ))
+    .
+
+
+let smtp_client(prov:provider,dom_client:dom,ip_client:ip,AS:as) =
+    (* Receive public information of the Recipient MX process *)
+    in(c, recipient_info:provider);
+    (* Receive public information of the resolver process *)
+    in(c, resolver_info:service);
+    !(
+    (* Choose fresh source port for each session *)
+    new port_client:port;
+    out(c,port_client);
+    (* Send src port over trusted channel to communication partner. The previous line seems redundant since the 
+    adversary can gain the same knowledge as the key to the private constructor is publically known. We keep this redundance because
+    the first line expresses that the port is publically known, whereas the second represents that it is sent over a trusted channel. *)
+    out(c,c_communicate_src_port(client_info(prov,AS,ip_client,dom_client),port_client));
+    let recipient_prov = get_prov_valid(recipient_info) in
+    let resolver_ip = get_res_ip(resolver_info) in
+    in(c, res_packed_src_port:com);
+    let res_port = r_get_src_port(resolver_info,res_packed_src_port) in
+    (* Build private channel over IPs, the fresh src port and the *)
+    (* public target port. *)
+    let clientchan = chanbuilder(ip_client, port_client, resolver_ip, RES_PORT) in
+    let clientchan2 = chanbuilder(resolver_ip, res_port,ip_client, CLIENT_PORT) in
+    (
+    ((* Corrupted IP -> Keys and Channels are leaked to the adversary *)
+    event C_ip(ip_client);
+    out(c,clientchan);
+    out(c,clientchan2))
+    |
+    ((* Corrupted AS -> all IPs located in this AS are leaked -> *)
+    (* Corrupted IP -> Keys and Channels are leaked to the adversary *)
+    event C_as(AS);
+    event C_ip(ip_client);
+    out(c,clientchan);
+    out(c,clientchan2))
+    |
+    ((* Adversary chooses an AS to be corrupted and chooses to route *)
+    (* over this AS. This leaks the channel over this route to be leaked *)
+    in(c,inter1:as);
+    let resolver_as1 = get_res_as(resolver_info) in
+      event Routing(AS, inter1, resolver_as1);
+      event C_as(inter1);
+      event C_routing(ip_client,resolver_ip);
+      out(c,clientchan))
+    |
+    ((* Adversary chooses an AS to be corrupted and chooses to route *)
+    (* over this AS. This leaks the channel over this route to be leaked *)
+    in(c,inter11:as);
+    let resolver_as2 = get_res_as(resolver_info) in
+      event Routing(resolver_as2, inter11, AS);
+      event C_as(inter11);
+      event C_routing(ip_client,resolver_ip);
+      out(c,clientchan2))
+    |
+    (event queries_prov(ip_client,recipient_prov);
+    event Resolver(ip_client,resolver_ip);
+    (* Goal: Send mail to recipient. *)
+    (* Send request for domain resolution to resolver *)
+    out(c,req_packet(clientchan,request(recipient_prov)));
+    (* Receive mailserver domain and IP from resolver  *)
+    in(c, answeri:bitstring);
+      let real_pack = get_ans_packet(clientchan2, answeri) in
+        let req = check_answer_req(real_pack) in
+          if req = request(recipient_prov) then
+            let IP = get_answer_ip(real_pack) in
+              let recipient_dom = get_answer_dom(real_pack) in
+                event Received(recipient_prov,recipient_dom,IP);
+                in(c, server_packed_src_port:com);
+                let server_port = s_get_src_port(IP,server_packed_src_port) in
+                (* Build private channel over the received IP, the fresh src port *)
+                (* and the public target port. *)
+                let clientchan3 = chanbuilder(ip_client,port_client,IP,SERVER_PORT) in
+                let clientchan4 = chanbuilder(IP, server_port, ip_client, CLIENT_PORT) in
+                (
+                ((* Corrupted IP -> Keys and Channels are leaked to the adversary *)
+                event C_ip(ip_client);
+                out(c,clientchan3);
+                out(c,clientchan4))
+                |
+                ((* Adversary chooses an AS to be corrupted and chooses to route *)
+                (* over this AS. This leaks the channel over this route to be leaked *)
+                event C_as(AS);
+                event C_ip(ip_client);
+                out(c,clientchan3);
+                out(c, clientchan4))
+                |
+                (
+                (* freshly choose challenge mail to send *)
+                new mail:bitstring;
+                out(c,req_packet(clientchan3,smtp_req(ip_client,IP,mail)));
+                in(c, answer_pak:bitstring);
+                (* Receive acknowledgement of the receiver *)
+                if OK = get_ans_packet(clientchan4,answer_pak) then
+                (* Wait for adversary to send the challenge mail *)
+                (* If the adversary can provide the challenge, *)
+                (* the mail delivery is unconfidential *)
+                in(c, challenge:bitstring);
+                if challenge=mail then
+                    event Unconf(prov, recipient_prov))
+                )
+    )))
+    .
+
+
+let smtp_server(prov:provider,dom_server:dom,IP:ip,AS:as) =
+    (* Receive public information of the Client MX process *)
+    in(c, clientinfo:service);
+    !(
+    (* Choose fresh source port for each session *)
+    new server_port:port;
+    out(c, server_port);
+    (* Send src port over trusted channel to communication partner. The previous line seems redundant since the 
+    adversary can gain the same knowledge as the key to the private constructor is publically known. We keep this redundance because
+    the first line expresses that the port is publically known, whereas the second represents that it is sent over a trusted channel. *)
+    out(c, s_communicate_src_port(IP,server_port));  
+    let client_ip = get_client_ip(clientinfo) in
+    in(c, client_port:port);
+    (* Build private channel over IPs, the fresh src port and the *)
+    (* public target port. *)
+    let serverchan = chanbuilder(client_ip, client_port, IP, SERVER_PORT) in
+    let serverchan2 = chanbuilder(IP, server_port, client_ip, CLIENT_PORT) in
+    (
+     ((* Corrupted IP -> Keys and Channels are leaked to the adversary *)
+      event C_ip(IP);
+      out(c,serverchan);
+      out(c,serverchan2))
+     |
+     ((* Corrupted AS -> all IPs located in this AS are leaked -> *)
+      (* Corrupted IP -> Keys and Channels are leaked to the adversary *)
+      event C_as(AS);
+      event C_ip(IP);
+      out(c,serverchan);
+      out(c,serverchan2))
+     |
+     ((* Adversary chooses an AS to be corrupted and chooses to route *)
+      (* over this AS. This leaks the channel over this route to be leaked *)
+      in(c,inter1:as);
+      let as_c1 = get_client_as(clientinfo) in
+      event Routing(as_c1, inter1, AS);
+      event C_as(inter1);
+      event C_routing(get_client_ip(clientinfo),IP);
+      out(c,serverchan))
+    |
+    ((* Adversary chooses an AS to be corrupted and chooses to route *)
+      (* over this AS. This leaks the channel over this route to be leaked *)
+      in(c,inter2:as);
+      let as_c2 = get_client_as(clientinfo) in
+      event Routing(as_c2, inter2, AS);
+      event C_as(inter2);
+      event C_routing(get_client_ip(clientinfo),IP);
+      out(c,serverchan2))
+    |
+    ( (* Receive Message from the client MX *)
+    in(c, message:bitstring);
+    let real_pack = get_req_packet(serverchan, message) in
+            let mail = smtp_third(real_pack) in
+            (* acknowledge receiption of the message *)
+            out(c, ans_packet(serverchan2,OK)))
+    ))
+    .
+
+process
+(
+  !(in(c,prov:provider);
+    !(
+      in(c, dom_c:dom);
+      in(c, ip_c:ip);
+      in(c, AS_c:as);
+      event isMailserver(dom_c,prov);
+      event IPinAS(ip_c,AS_c);
+      event A_record(ip_c,dom_c);
+      out(c,client_info(prov,AS_c,ip_c,dom_c));
+      (* *)
+      !(smtp_client(prov,dom_c,ip_c,AS_c))
+      )
+    |
+    !(
+      in(c, dom_s:dom);
+      in(c, ip_s:ip);
+      in(c, AS_s:as);
+      event isMailserver(dom_s,prov);
+      event IPinAS(ip_s,AS_s);
+      event A_record(ip_s,dom_s);
+      event Register_A(dom_s,ip_s);
+      event Register_MX(prov,dom_s);
+      out(c,server_info(prov,AS_s,ip_s,dom_s));
+      out(c,register_server(dom_s,ip_s));
+      out(c,register_provider(prov,dom_s));
+      out(c,valid_prov(prov));
+      (* *)
+      !(smtp_server(prov,dom_s,ip_s,AS_s))
+      )
+    |
+    !(
+      in(c, dom_r:dom);
+      in(c, ip_r:ip);
+      in(c, AS_r:as);
+      event IPinAS(ip_r,AS_r);
+      event A_record(ip_r,dom_r);
+      out(c,res_info(dom_r,ip_r,AS_r));
+      (* *)
+      !(resolver(dom_r,ip_r,AS_r))
+      )
+    |
+    !(
+      in(c, dom_d:dom);
+      in(c, ip_d:ip);
+      in(c, AS_d:as);
+      event IPinAS(ip_d,AS_d);
+      event A_record(ip_d,dom_d);
+      out(c,dns_info(dom_d,ip_d,AS_d));
+      (* *)
+      !(dns_server(dom_d,ip_d,AS_d))
+      )
+    |
+    !(
+      in(c, dom_root:dom);
+      in(c, ip_root:ip);
+      in(c, AS_root:as);
+      event IPinAS(ip_root,AS_root);
+      event A_record(ip_root,dom_root);
+      out(c,root_info(dom_root,ip_root,AS_root));
+      (* *)
+      !(root_server(dom_root,ip_root,AS_root))
+      )
+    )
+  )
